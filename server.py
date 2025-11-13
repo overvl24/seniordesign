@@ -1,5 +1,8 @@
-# Basic Flask server to trigger simulate_scan in Supabase
-# Run with Flask + Requests installed (Linux instance friendly)
+# Basic Flask server to talk to Supabase
+# - /scan: simulate a scan (RFID + class_code)
+# - /class_rfids: return all RFIDs enrolled in a given class
+#
+# Run with:  python server.py
 
 import requests
 from flask import Flask, request, jsonify
@@ -10,54 +13,171 @@ SUPABASE_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSI
 
 app = Flask(__name__)
 
-# --- New: POST /scan — expects { "class_code": "...", "rfid": "..." } ---
-@app.route('/scan', methods=['POST'])
-def scan():
-    data = request.get_json()
-    print("Received JSON:", data)
-
-    if not data or 'class_code' not in data or 'rfid' not in data:
-        return jsonify({"status": "error", "message": "JSON must include 'class_code' and 'rfid'"}), 400
-
-    ok, resp_text = simulate_scan_rpc(
-        rfid_uid=data['rfid'],
-        class_code=data['class_code'],
-        auto_enroll=True  # set False if you don't want to auto-enroll unknown students
-    )
-
-    if ok:
-        return jsonify({"status": "success", "message": "Scan recorded", "detail": resp_text}), 200
-    else:
-        return jsonify({"status": "error", "message": "Supabase RPC failed", "detail": resp_text}), 500
-
-
-def simulate_scan_rpc(rfid_uid: str, class_code: str, auto_enroll: bool = True):
-    """
-    Calls PostgREST RPC: public.simulate_scan(p_rfid_uid text, p_class_code text, p_auto_enroll boolean)
-    Example: select * from public.simulate_scan('JK3323es', 'ELE-3701', true);
-    """
-    url = f"{SUPABASE_URL}/rest/v1/rpc/simulate_scan"
-    headers = {
+# -------------------------------------------------------------------
+# Helper: basic headers for Supabase REST
+# -------------------------------------------------------------------
+def supabase_headers():
+    return {
         "apikey": SUPABASE_API_KEY,
         "Authorization": f"Bearer {SUPABASE_API_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation"  # harmless if function returns void
+        "Accept": "application/json",
     }
-    payload = {
-        "p_rfid_uid": rfid_uid,
-        "p_class_code": class_code,
-        "p_auto_enroll": auto_enroll
-    }
+
+# -------------------------------------------------------------------
+# 1) /scan  – simulate a scan via public.simulate_scan
+#    Body (JSON): { "rfid": "JK3323es", "class_code": "ELE-3701" }
+# -------------------------------------------------------------------
+@app.route("/scan", methods=["POST"])
+def scan():
+    data = request.get_json(silent=True) or {}
+    print("Received /scan JSON:", data)
+
+    rfid = data.get("rfid")
+    class_code = data.get("class_code")
+
+    if not rfid or not class_code:
+        return jsonify({
+            "ok": False,
+            "error": "BAD_REQUEST",
+            "message": "JSON must include 'rfid' and 'class_code'"
+        }), 400
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
-        print("Supabase RPC response:", resp.status_code, resp.text)
-        # PostgREST returns 200 for successful RPC (even if function returns void)
-        return (resp.status_code == 200, resp.text)
-    except Exception as e:
-        return (False, str(e))
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/simulate_scan",
+            headers=supabase_headers(),
+            json={
+                "p_rfid_uid": rfid,
+                "p_class_code": class_code,
+                "p_auto_enroll": False
+            },
+            timeout=3.0,
+        )
+    except requests.exceptions.RequestException as e:
+        print("Supabase simulate_scan error:", e)
+        return jsonify({"ok": False, "error": "SUPABASE_DOWN"}), 502
+
+    print("Supabase simulate_scan response:", resp.status_code, resp.text)
+
+    # Pass through the Supabase JSON, but wrap with ok / http code
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"raw": resp.text}
+
+    if resp.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": "SUPABASE_ERROR",
+            "status": resp.status_code,
+            "body": payload,
+        }), 502
+
+    return jsonify({
+        "ok": True,
+        "status": "scan_processed",
+        "rpc": payload,
+    }), 200
+
+# -------------------------------------------------------------------
+# 2) /class_rfids – get all RFIDs for a class code
+#    Body (TEXT): "CPE-0002 ALLSTDNT"
+#    Returns: JSON { ok, class_code, count, rfids:[...] }
+# -------------------------------------------------------------------
+@app.route("/class_rfids", methods=["POST"])
+def class_rfids():
+    """
+    Expect raw body like:  CPE-0002 ALLSTDNT
+    Returns all RFIDs enrolled in that class.
+    """
+
+    raw = request.get_data(as_text=True).strip()
+    print("Received /class_rfids raw body:", repr(raw))
+
+    if not raw:
+        return jsonify({
+            "ok": False,
+            "error": "EMPTY_BODY",
+            "message": "Expected '<CLASS_CODE> ALLSTDNT'"
+        }), 400
+
+    parts = raw.split()
+    if len(parts) != 2:
+        return jsonify({
+            "ok": False,
+            "error": "BAD_FORMAT",
+            "message": "Expected exactly: <CLASS_CODE> ALLSTDNT"
+        }), 400
+
+    class_code, cmd = parts[0], parts[1]
+    if cmd.upper() != "ALLSTDNT":
+        return jsonify({
+            "ok": False,
+            "error": "UNKNOWN_COMMAND",
+            "command": cmd,
+            "expected": "ALLSTDNT"
+        }), 400
+
+    # Call Supabase RPC: public.rfids_for_class(p_class_code)
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/rfids_for_class",
+            headers=supabase_headers(),
+            json={"p_class_code": class_code},
+            timeout=3.0,
+        )
+    except requests.exceptions.RequestException as e:
+        print("Supabase rfids_for_class error:", e)
+        return jsonify({"ok": False, "error": "SUPABASE_DOWN"}), 502
+
+    print("Supabase rfids_for_class response:", resp.status_code, resp.text)
+
+    if resp.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": "SUPABASE_ERROR",
+            "status": resp.status_code,
+            "body": resp.text,
+        }), 502
+
+    try:
+        rows = resp.json()  # [{ "rfid_uid": "..." }, ...]
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "error": "BAD_SUPABASE_JSON",
+            "body": resp.text,
+        }), 502
+
+    rfids = [row["rfid_uid"] for row in rows if row.get("rfid_uid")]
+
+    # JSON response (easy to debug & use)
+    return jsonify({
+        "ok": True,
+        "class_code": class_code,
+        "count": len(rfids),
+        "rfids": rfids,
+    }), 200
+
+    # If later you want PLAIN TEXT (one RFID per line) for the STM32,
+    # you can replace the return above with:
+    #
+    # text_body = "\n".join(rfids) + "\n"
+    # return text_body, 200, {"Content-Type": "text/plain"}
 
 
-if __name__ == '__main__':
-    # Change port if your host expects something else (e.g., Render uses PORT env var)
-    app.run(host='0.0.0.0', port=8080)
+# -------------------------------------------------------------------
+# Optional: simple health check
+# -------------------------------------------------------------------
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"ok": True}), 200
+
+
+# -------------------------------------------------------------------
+# Start the server
+# -------------------------------------------------------------------
+if __name__ == "__main__":
+    # For local testing
+    app.run(host="0.0.0.0", port=8080)
