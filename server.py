@@ -1,8 +1,8 @@
 # Basic Flask server to talk to Supabase
-# - /scan: simulate a scan (RFID + class_code)
+# - /scan: simulate a scan (RFID + class_code [+ optional hhmm])
 # - /class_rfids: return all RFIDs enrolled in a given class
 #
-# Run with:  python server.py
+# Run locally with:  python server.py
 
 import requests
 from flask import Flask, request, jsonify
@@ -25,8 +25,10 @@ def supabase_headers():
     }
 
 # -------------------------------------------------------------------
-# 1) /scan  – simulate a scan via public.simulate_scan
-#    Body (JSON): { "rfid": "JK3323es", "class_code": "ELE-3701" }
+# 1) /scan – simulate a scan via public.simulate_scan
+#    Body (JSON):
+#       { "rfid": "JK3323es", "class_code": "ELE-3701" }
+#    or { "rfid": "JK3323es", "class_code": "ELE-3701", "hhmm": "1640" }
 # -------------------------------------------------------------------
 @app.route("/scan", methods=["POST"])
 def scan():
@@ -35,6 +37,7 @@ def scan():
 
     rfid = data.get("rfid")
     class_code = data.get("class_code")
+    hhmm = data.get("hhmm")  # optional time override as string, e.g. "905" or "1640"
 
     if not rfid or not class_code:
         return jsonify({
@@ -43,15 +46,30 @@ def scan():
             "message": "JSON must include 'rfid' and 'class_code'"
         }), 400
 
+    # Optional: validate hhmm if provided
+    if hhmm is not None:
+        if not isinstance(hhmm, str) or not (3 <= len(hhmm) <= 4) or not hhmm.isdigit():
+            return jsonify({
+                "ok": False,
+                "error": "BAD_HHMM",
+                "message": "hhmm must be a 3–4 digit string like '900' or '1640'"
+            }), 400
+
+    # Build RPC payload according to your Postgres function signature:
+    # simulate_scan(p_rfid_uid text, p_class_code text, p_hhmm text default null, p_auto_enroll boolean default false)
+    payload = {
+        "p_rfid_uid": rfid,
+        "p_class_code": class_code,
+        "p_auto_enroll": False
+    }
+    if hhmm is not None:
+        payload["p_hhmm"] = hhmm
+
     try:
         resp = requests.post(
             f"{SUPABASE_URL}/rest/v1/rpc/simulate_scan",
             headers=supabase_headers(),
-            json={
-                "p_rfid_uid": rfid,
-                "p_class_code": class_code,
-                "p_auto_enroll": False
-            },
+            json=payload,
             timeout=3.0,
         )
     except requests.exceptions.RequestException as e:
@@ -60,24 +78,24 @@ def scan():
 
     print("Supabase simulate_scan response:", resp.status_code, resp.text)
 
-    # Pass through the Supabase JSON, but wrap with ok / http code
+    # Try to parse JSON response from Supabase
     try:
-        payload = resp.json()
+        payload_resp = resp.json()
     except ValueError:
-        payload = {"raw": resp.text}
+        payload_resp = {"raw": resp.text}
 
     if resp.status_code != 200:
         return jsonify({
             "ok": False,
             "error": "SUPABASE_ERROR",
             "status": resp.status_code,
-            "body": payload,
+            "body": payload_resp,
         }), 502
 
     return jsonify({
         "ok": True,
         "status": "scan_processed",
-        "rpc": payload,
+        "rpc": payload_resp,
     }), 200
 
 # -------------------------------------------------------------------
@@ -152,7 +170,6 @@ def class_rfids():
 
     rfids = [row["rfid_uid"] for row in rows if row.get("rfid_uid")]
 
-    # JSON response (easy to debug & use)
     return jsonify({
         "ok": True,
         "class_code": class_code,
@@ -160,20 +177,12 @@ def class_rfids():
         "rfids": rfids,
     }), 200
 
-    # If later you want PLAIN TEXT (one RFID per line) for the STM32,
-    # you can replace the return above with:
-    #
-    # text_body = "\n".join(rfids) + "\n"
-    # return text_body, 200, {"Content-Type": "text/plain"}
-
-
 # -------------------------------------------------------------------
 # Optional: simple health check
 # -------------------------------------------------------------------
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return jsonify({"ok": True}), 200
-
 
 # -------------------------------------------------------------------
 # Start the server
