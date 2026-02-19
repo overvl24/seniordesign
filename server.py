@@ -232,7 +232,7 @@ def version_update():
 
     print("Supabase set_version response:", resp.status_code, resp.text)
 
-    if resp.status_code != 200:
+    if resp.status_code not in (200, 204):
         return jsonify({
             "ok": False,
             "error": "SUPABASE_ERROR",
@@ -259,4 +259,5 @@ def healthz():
 if __name__ == "__main__":
     # For local testing
     app.run(host="0.0.0.0", port=8080)
+
 
