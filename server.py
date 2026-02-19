@@ -176,6 +176,75 @@ def class_rfids():
         "count": len(rfids),
         "rfids": rfids,
     }), 200
+# -------------------------------------------------------------------
+# 3) /version_update – set current system version
+#    Body (TEXT): "VERSIONUPDATE 1.7"
+#    Updates: public.version.current_version (typically row id=1)
+# -------------------------------------------------------------------
+@app.route("/version_update", methods=["POST"])
+def version_update():
+    raw = request.get_data(as_text=True).strip()
+    print("Received /version_update raw body:", repr(raw))
+
+    if not raw:
+        return jsonify({
+            "ok": False,
+            "error": "EMPTY_BODY",
+            "message": "Expected 'VERSIONUPDATE <version>'"
+        }), 400
+
+    parts = raw.split()
+    if len(parts) != 2:
+        return jsonify({
+            "ok": False,
+            "error": "BAD_FORMAT",
+            "message": "Expected exactly: VERSIONUPDATE <version>"
+        }), 400
+
+    cmd, new_version = parts[0], parts[1]
+    if cmd.upper() != "VERSIONUPDATE":
+        return jsonify({
+            "ok": False,
+            "error": "UNKNOWN_COMMAND",
+            "command": cmd,
+            "expected": "VERSIONUPDATE"
+        }), 400
+
+    # Basic version validation: allow digits and dots only (e.g., 1.7, 1.7.2)
+    if not all(c.isdigit() or c == "." for c in new_version) or new_version.startswith(".") or new_version.endswith("."):
+        return jsonify({
+            "ok": False,
+            "error": "BAD_VERSION",
+            "message": "Version must look like '1.7' or '1.7.2' (digits and dots only)"
+        }), 400
+
+    # Call Supabase RPC: public.set_version(new_version text)
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/set_version",
+            headers=supabase_headers(),
+            json={"new_version": new_version},
+            timeout=3.0,
+        )
+    except requests.exceptions.RequestException as e:
+        print("Supabase set_version error:", e)
+        return jsonify({"ok": False, "error": "SUPABASE_DOWN"}), 502
+
+    print("Supabase set_version response:", resp.status_code, resp.text)
+
+    if resp.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": "SUPABASE_ERROR",
+            "status": resp.status_code,
+            "body": resp.text,
+        }), 502
+
+    return jsonify({
+        "ok": True,
+        "status": "version_updated",
+        "current_version": new_version
+    }), 200
 
 # -------------------------------------------------------------------
 # Optional: simple health check
@@ -190,3 +259,4 @@ def healthz():
 if __name__ == "__main__":
     # For local testing
     app.run(host="0.0.0.0", port=8080)
+
