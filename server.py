@@ -1,8 +1,14 @@
 # Basic Flask server to talk to Supabase
 # - /scan: simulate a scan (RFID + class_code [+ optional hhmm])
-# - /class_rfids: return all RFIDs enrolled in a given class
+# - /class_rfids: return all RFIDs enrolled in a given class (via RPC rfids_for_class)
+# - /getclasses: return all classes (class_code) when receiving command GETCLASSES
+# - /version_update: write a version number (via RPC set_version)
 #
-# Run locally with:  python server.py
+# Run locally with:
+#   python server.py
+#
+# Deploy on Render: set Start Command to:
+#   gunicorn server:app
 
 import requests
 from flask import Flask, request, jsonify
@@ -55,8 +61,6 @@ def scan():
                 "message": "hhmm must be a 3–4 digit string like '900' or '1640'"
             }), 400
 
-    # Build RPC payload according to your Postgres function signature:
-    # simulate_scan(p_rfid_uid text, p_class_code text, p_hhmm text default null, p_auto_enroll boolean default false)
     payload = {
         "p_rfid_uid": rfid,
         "p_class_code": class_code,
@@ -78,7 +82,6 @@ def scan():
 
     print("Supabase simulate_scan response:", resp.status_code, resp.text)
 
-    # Try to parse JSON response from Supabase
     try:
         payload_resp = resp.json()
     except ValueError:
@@ -101,15 +104,9 @@ def scan():
 # -------------------------------------------------------------------
 # 2) /class_rfids – get all RFIDs for a class code
 #    Body (TEXT): "CPE-0002 ALLSTDNT"
-#    Returns: JSON { ok, class_code, count, rfids:[...] }
 # -------------------------------------------------------------------
 @app.route("/class_rfids", methods=["POST"])
 def class_rfids():
-    """
-    Expect raw body like:  CPE-0002 ALLSTDNT
-    Returns all RFIDs enrolled in that class.
-    """
-
     raw = request.get_data(as_text=True).strip()
     print("Received /class_rfids raw body:", repr(raw))
 
@@ -137,7 +134,6 @@ def class_rfids():
             "expected": "ALLSTDNT"
         }), 400
 
-    # Call Supabase RPC: public.rfids_for_class(p_class_code)
     try:
         resp = requests.post(
             f"{SUPABASE_URL}/rest/v1/rpc/rfids_for_class",
@@ -168,7 +164,7 @@ def class_rfids():
             "body": resp.text,
         }), 502
 
-    rfids = [row["rfid_uid"] for row in rows if row.get("rfid_uid")]
+    rfids = [row.get("rfid_uid") for row in rows if row.get("rfid_uid")]
 
     return jsonify({
         "ok": True,
@@ -176,10 +172,91 @@ def class_rfids():
         "count": len(rfids),
         "rfids": rfids,
     }), 200
+
 # -------------------------------------------------------------------
-# 3) /version_update – set current system version
+# 3) /getclasses – list all class codes
+#    Body (TEXT): "GETCLASSES"
+#    Returns: JSON { ok, count, class_codes:[...] }
+# -------------------------------------------------------------------
+@app.route("/getclasses", methods=["POST"])
+def getclasses():
+    raw = request.get_data(as_text=True).strip()
+    print("Received /getclasses raw body:", repr(raw))
+
+    if not raw:
+        return jsonify({
+            "ok": False,
+            "error": "EMPTY_BODY",
+            "message": "Expected 'GETCLASSES'"
+        }), 400
+
+    parts = raw.split()
+    if len(parts) != 1:
+        return jsonify({
+            "ok": False,
+            "error": "BAD_FORMAT",
+            "message": "Expected exactly: GETCLASSES"
+        }), 400
+
+    cmd = parts[0].upper()
+    if cmd != "GETCLASSES":
+        return jsonify({
+            "ok": False,
+            "error": "UNKNOWN_COMMAND",
+            "command": parts[0],
+            "expected": "GETCLASSES"
+        }), 400
+
+    # Pull directly from Supabase table classes (PostgREST)
+    # GET /rest/v1/classes?select=class_code&order=class_code.asc
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/classes",
+            headers={
+                "apikey": SUPABASE_API_KEY,
+                "Authorization": f"Bearer {SUPABASE_API_KEY}",
+                "Accept": "application/json",
+            },
+            params={
+                "select": "class_code",
+                "order": "class_code.asc"
+            },
+            timeout=3.0,
+        )
+    except requests.exceptions.RequestException as e:
+        print("Supabase get classes error:", e)
+        return jsonify({"ok": False, "error": "SUPABASE_DOWN"}), 502
+
+    print("Supabase classes response:", resp.status_code, resp.text)
+
+    if resp.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": "SUPABASE_ERROR",
+            "status": resp.status_code,
+            "body": resp.text,
+        }), 502
+
+    try:
+        rows = resp.json()  # [{ "class_code": "..." }, ...]
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "error": "BAD_SUPABASE_JSON",
+            "body": resp.text,
+        }), 502
+
+    class_codes = [r.get("class_code") for r in rows if r.get("class_code")]
+
+    return jsonify({
+        "ok": True,
+        "count": len(class_codes),
+        "class_codes": class_codes
+    }), 200
+
+# -------------------------------------------------------------------
+# 4) /version_update – set current system version
 #    Body (TEXT): "VERSIONUPDATE 1.7"
-#    Updates: public.version.current_version (typically row id=1)
 # -------------------------------------------------------------------
 @app.route("/version_update", methods=["POST"])
 def version_update():
@@ -210,7 +287,7 @@ def version_update():
             "expected": "VERSIONUPDATE"
         }), 400
 
-    # Basic version validation: allow digits and dots only (e.g., 1.7, 1.7.2)
+    # Basic version validation: allow digits and dots only
     if not all(c.isdigit() or c == "." for c in new_version) or new_version.startswith(".") or new_version.endswith("."):
         return jsonify({
             "ok": False,
@@ -218,7 +295,6 @@ def version_update():
             "message": "Version must look like '1.7' or '1.7.2' (digits and dots only)"
         }), 400
 
-    # Call Supabase RPC: public.set_version(new_version text)
     try:
         resp = requests.post(
             f"{SUPABASE_URL}/rest/v1/rpc/set_version",
@@ -257,7 +333,4 @@ def healthz():
 # Start the server
 # -------------------------------------------------------------------
 if __name__ == "__main__":
-    # For local testing
     app.run(host="0.0.0.0", port=8080)
-
-
